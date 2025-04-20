@@ -49,6 +49,14 @@ def extract_contacts(url):
         st.warning(f"Error scraping {url}: {e}")
     return list(emails), list(phones)
 
+def convert_df(df):
+    # Save the DataFrame to a BytesIO buffer
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False)
+    buffer.seek(0)  # Reset the pointer to the beginning of the buffer
+    return buffer
+
 # ——— File upload & processing ———
 uploaded = st.file_uploader("📂 Upload your Excel (.xlsx)", type="xlsx")
 if uploaded:
@@ -67,7 +75,7 @@ if uploaded:
             df.at[i,'Emails'] = ', '.join(ems) or 'No Emails'
             df.at[i,'Phones'] = ', '.join(phs) or 'No Phones'
         prog.progress((i+1)/len(df))
-        time.sleep(5)  # slow it down on purpose
+        time.sleep(3)  # slow it down on purpose
 
     status.text("✅ Scraping complete—enjoy your data!")
     st.dataframe(df)
