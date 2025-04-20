@@ -50,6 +50,7 @@ if uploaded_file is not None:
     progress = st.progress(0)
     status_text = st.empty()
 
+    # Process each company
     for i, company in enumerate(df[company_column]):
         status_text.text(f"Processing {i+1}/{len(df)}: {company}")
         website = get_company_website(company)
@@ -65,8 +66,7 @@ if uploaded_file is not None:
     status_text.text("✅ Scraping Complete! Please download the results below.")
     st.write(df)
 
-    # Download the file
-    @st.cache_data
+    # Convert DataFrame to Excel and provide download
     def convert_df(df):
         return df.to_excel(index=False, engine='openpyxl')
 
