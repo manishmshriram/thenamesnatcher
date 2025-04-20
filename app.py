@@ -24,8 +24,8 @@ def extract_contacts(url):
         if response.status_code == 200:
             soup = BeautifulSoup(response.text, 'html.parser')
             text = soup.get_text()
-            emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text))
-            phones = set(re.findall(r'\+?\d{1,4}?[ \s.-]?\(?\d{2,4}\)?[ \s.-]?\d{3,4}[ \s.-]?\d{3,4}', text))
+            emails = set(re.findall(r'[a-zA-Z0-9._%+-]+@[a-zAZA0-9.-]+\.[a-zA-Z]{2,}', text))
+            phones = set(re.findall(r'\+?\d{1,4}?[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}', text))
     except Exception as e:
         print(f"Error fetching {url}: {e}")
     return list(emails), list(phones)
@@ -53,15 +53,20 @@ if uploaded_file is not None:
     # Process each company
     for i, company in enumerate(df[company_column]):
         status_text.text(f"Processing {i+1}/{len(df)}: {company}")
+        
+        # Get the company website
         website = get_company_website(company)
         df.at[i, 'Website'] = website if website else 'Not Found'
+        
         if website:
+            # Extract emails and phone numbers from the website
             emails, phones = extract_contacts(website)
-            df.at[i, 'Emails'] = ', '.join(emails)
-            df.at[i, 'Phones'] = ', '.join(phones)
+            df.at[i, 'Emails'] = ', '.join(emails) if emails else 'No Emails Found'
+            df.at[i, 'Phones'] = ', '.join(phones) if phones else 'No Phones Found'
+        
         progress.progress((i + 1) / len(df))
-        time.sleep(2)  # Delay to prevent blocking
-    
+        time.sleep(3)  # Delay of 3 seconds per company to prevent getting blocked
+
     # Display final message
     status_text.text("✅ Scraping Complete! Please download the results below.")
     st.write(df)
@@ -70,8 +75,10 @@ if uploaded_file is not None:
     def convert_df(df):
         return df.to_excel(index=False, engine='openpyxl')
 
+    # Convert the dataframe and save to output path
     output = convert_df(df)
     
+    # Provide the download button for the user
     st.download_button(
         label="📥 Download Results as Excel",
         data=output,
