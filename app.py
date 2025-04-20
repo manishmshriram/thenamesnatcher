@@ -30,7 +30,8 @@ st.write("Upload an Excel file with company names, and I'll fetch sites, emails 
 def get_company_website(company_name):
     query = f"{company_name} official site"
     try:
-        for url in search(query, num=1, stop=1, pause=2):
+        # Updated search function without 'num'
+        for url in search(query, stop=1, pause=2):
             return url
     except Exception as e:
         st.error(f"Search error for “{company_name}”: {e}")
@@ -66,20 +67,17 @@ if uploaded:
             df.at[i,'Emails'] = ', '.join(ems) or 'No Emails'
             df.at[i,'Phones'] = ', '.join(phs) or 'No Phones'
         prog.progress((i+1)/len(df))
-        time.sleep(3)  # slow it down on purpose
+        time.sleep(5)  # slow it down on purpose
 
     status.text("✅ Scraping complete—enjoy your data!")
     st.dataframe(df)
 
     # ——— Prepare download ———
-    buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
-    buffer.seek(0)
+    output = convert_df(df)
 
     st.download_button(
         label="📥 Download Results",
-        data=buffer,
+        data=output,
         file_name="Company_Contacts.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
