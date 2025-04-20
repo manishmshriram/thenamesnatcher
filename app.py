@@ -5,7 +5,6 @@ import time
 import requests
 from bs4 import BeautifulSoup
 from googlesearch import search
-from google.colab import files  # Import to enable file download
 
 # --- Functions ---
 def get_company_website(company_name):
