@@ -1,99 +1,110 @@
 import streamlit as st
 import pandas as pd
+import re
 import requests
 from bs4 import BeautifulSoup
-import re
+from googlesearch import search
 import time
-import urllib.parse
-import io
+from io import BytesIO
+import random
 
-# -------------------- Helper Functions --------------------
+# --- Streamlit Page Setup ---
+st.set_page_config(page_title="Contact Scraper", layout="centered")
+st.title("📞 Company Contact Scraper")
+st.write("Upload an Excel file with company names to fetch websites, emails, and phone numbers.")
 
-def google_search(company_name):
-    query = f"{company_name} contact site:.com"
-    url = f"https://duckduckgo.com/html/?q={urllib.parse.quote(query)}"
-    headers = {
-        "User-Agent": "Mozilla/5.0"
-    }
+# --- User Upload ---
+uploaded_file = st.file_uploader("Upload your Excel file (first column should have company names)", type=["xlsx"])
+
+# --- Helper Functions ---
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+    "Mozilla/5.0 (X11; Linux x86_64)",
+    "Mozilla/5.0 (Windows NT 6.1; Win64; x64)",
+]
+
+def get_company_website(company_name):
+    query = f"{company_name} official site"
     try:
-        res = requests.get(url, headers=headers, timeout=15)
-        time.sleep(5)
-        soup = BeautifulSoup(res.text, "html.parser")
-        links = [a['href'] for a in soup.select('.result__a') if 'http' in a['href']]
-        return links
-    except:
-        return []
+        for url in search(query, num=1, stop=1, pause=2):
+            return url
+    except Exception as e:
+        st.warning(f"Google Search failed for {company_name}: {e}")
+        return None
 
 def extract_contacts(url):
+    emails, phones = set(), set()
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0"
+            'User-Agent': random.choice(USER_AGENTS),
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
         }
-        res = requests.get(url, headers=headers, timeout=15)
-        time.sleep(5)
-        soup = BeautifulSoup(res.text, "html.parser")
+        response = requests.get(url, headers=headers, timeout=10)
+        if response.status_code != 200:
+            st.warning(f"Blocked or failed ({response.status_code}): {url}")
+            return [], []
+
+        soup = BeautifulSoup(response.text, 'html.parser')
         text = soup.get_text()
 
-        emails = list(set(re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)))
-        phones = list(set(re.findall(r"\+?\d[\d\s().-]{7,}\d", text)))
-        return emails, phones
-    except:
-        return [], []
+        emails = set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text))
+        phones = set(re.findall(r"\+?\d[\d\s().-]{7,}\d", text))
 
-# -------------------- Streamlit UI --------------------
+        # Optional cleanup
+        emails = {email for email in emails if not email.endswith("@example.com")}
+        phones = {phone.strip() for phone in phones if len(phone) >= 8}
 
-st.set_page_config(page_title="Contact Finder", layout="centered")
-st.title("📄 Excel Contact Scraper - Slow & Accurate")
-st.markdown("Upload an Excel file with a column named `Company`. I’ll find emails and phone numbers for each company. Be patient — it takes time for good results (5–10 secs per company).")
+    except Exception as e:
+        st.warning(f"Error scraping {url}: {e}")
+    return list(emails), list(phones)
 
-uploaded_file = st.file_uploader("Upload Excel File", type=["xlsx"])
-
-if uploaded_file:
+# --- Main Logic ---
+if uploaded_file is not None:
     try:
         df = pd.read_excel(uploaded_file)
-        if "Company" not in df.columns:
-            st.error("Excel must have a column named 'Company'.")
-        else:
-            if st.button("🔍 Start Scraping"):
-                result_data = []
+        company_column = df.columns[0]  # First column as company name
 
-                for index, row in df.iterrows():
-                    company = str(row["Company"])
-                    st.info(f"Searching for: **{company}**")
+        df["Website"] = ""
+        df["Emails"] = ""
+        df["Phones"] = ""
 
-                    links = google_search(company)
-                    emails_found = []
-                    phones_found = []
+        progress = st.progress(0)
+        status_text = st.empty()
 
-                    for link in links[:3]:
-                        emails, phones = extract_contacts(link)
-                        emails_found.extend(emails)
-                        phones_found.extend(phones)
-                        time.sleep(5)
+        for i, company in enumerate(df[company_column]):
+            status_text.text(f"🔍 Processing {i+1}/{len(df)}: {company}")
+            try:
+                website = get_company_website(company)
+                df.at[i, "Website"] = website if website else "Not Found"
+                if website:
+                    emails, phones = extract_contacts(website)
+                    df.at[i, "Emails"] = ', '.join(emails) if emails else "Not Found"
+                    df.at[i, "Phones"] = ', '.join(phones) if phones else "Not Found"
+            except Exception as e:
+                st.warning(f"Error processing {company}: {e}")
+            progress.progress((i + 1) / len(df))
+            time.sleep(2)  # Add delay to avoid blocks
 
-                    emails_found = list(set(emails_found))
-                    phones_found = list(set(phones_found))
+        status_text.text("✅ Scraping Complete!")
+        st.write(df)
 
-                    result_data.append({
-                        "Company": company,
-                        "Emails": ", ".join(emails_found) if emails_found else "Not Found",
-                        "Phone Numbers": ", ".join(phones_found) if phones_found else "Not Found"
-                    })
+        # Excel Download
+        @st.cache_data
+        def convert_df(df):
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False)
+            return output.getvalue()
 
-                result_df = pd.DataFrame(result_data)
-                st.success("✅ Scraping Complete!")
-                st.dataframe(result_df)
+        output_data = convert_df(df)
+        st.download_button(
+            label="📥 Download Results as Excel",
+            data=output_data,
+            file_name="Contact_Scraped.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
 
-                # Downloadable output
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-                    result_df.to_excel(writer, index=False, sheet_name='Results')
-                    writer.save()
-                    st.download_button(
-                        label="📥 Download Results as Excel",
-                        data=output.getvalue(),
-                        file_name='contact_results.xlsx',
-                        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-                    )
     except Exception as e:
         st.error(f"Error reading file: {e}")
