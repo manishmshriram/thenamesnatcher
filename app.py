@@ -84,7 +84,7 @@ if uploaded_file is not None:
                     result_df.at[i, "Emails"] = "Error"
                     result_df.at[i, "Phones"] = "Error"
                 progress.progress((i + 1) / len(df))
-                time.sleep(2)
+                time.sleep(5)
 
             status.text("✅ Scraping completed!")
             st.write(result_df)
