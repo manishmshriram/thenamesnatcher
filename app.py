@@ -130,7 +130,7 @@ if uploaded_file is not None:
                 progress.progress((i + 1) / total)
 
                 # Random delay between 10 and 60 seconds after each company
-                sleep_time = random.randint(5, 10)
+                sleep_time = random.randint(3, 8)
                 logging.info(f"Sleeping for {sleep_time} seconds.")
                 time.sleep(sleep_time)
 
