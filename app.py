@@ -15,8 +15,6 @@ for pkg in ("googlesearch-python", "beautifulsoup4", "openpyxl"):
             pass  # if install fails, fallback code still tries duckduckgo
 
 # --- Imports ---
-from google.colab import files
-import ipywidgets as widgets
 from IPython.display import display, clear_output, HTML
 import pandas as pd, time, re, requests, random, math
 from bs4 import BeautifulSoup
