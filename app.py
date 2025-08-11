@@ -8,30 +8,29 @@ import time
 import random
 import logging
 from io import BytesIO
+from urllib.parse import urljoin, urlparse
 
-# --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# --- Streamlit Setup ---
+# --- Streamlit Page Config ---
 st.set_page_config(page_title="Contact Scraper", layout="centered")
 st.title("📞 Company Contact Scraper")
 st.write("Upload an Excel file and select the column containing company names.")
 
 uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 
-# --- User Agent Pool ---
+# --- User Agents Pool ---
 USER_AGENTS = [
-    # Expanded list for more variety
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:95.0) Gecko/20100101 Firefox/95.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:94.0) Gecko/20100101 Firefox/94.0",
     "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
-    # Add more if desired
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36"
 ]
 
-# --- Retry Decorator for Requests ---
-def retry_request(func, *args, retries=3, delay=10, **kwargs):
+# --- Retry helper ---
+def retry_request(func, *args, retries=3, delay=5, **kwargs):
     for attempt in range(1, retries + 1):
         try:
             return func(*args, **kwargs)
@@ -41,56 +40,65 @@ def retry_request(func, *args, retries=3, delay=10, **kwargs):
                 time.sleep(delay)
     return None
 
-# --- Scraping Functions ---
+# --- Get company website ---
 def get_company_website(company_name):
-    query = f"{company_name} official website"
+    query = f"{company_name} official site"
     try:
-        # Using retry wrapper around search to handle transient errors
-        results = retry_request(search, query, num_results=1)
+        results = retry_request(search, query, num_results=3)
         if results:
             for url in results:
-                logging.info(f"Found website for {company_name}: {url}")
-                return url
+                parsed = urlparse(url)
+                if parsed.scheme and parsed.netloc:
+                    return url
         return None
     except Exception as e:
         logging.warning(f"Website retrieval error for '{company_name}': {e}")
         return None
 
-def extract_contacts(url):
+# --- Extract emails & phones from a page ---
+def extract_contacts_from_url(url):
     emails, phones = set(), set()
-    try:
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept-Language": "en-US,en;q=0.9",
-        }
-        # Retry requests.get wrapped in retry_request for robustness
-        def make_request():
-            resp = requests.get(url, headers=headers, timeout=10)
-            resp.raise_for_status()
-            return resp
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    def make_request():
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        return resp
 
-        response = retry_request(make_request)
-        if response is None:
-            logging.warning(f"Failed to get a valid response from {url}")
-            return [], []
-
-        soup = BeautifulSoup(response.text, 'html.parser')
-        text = soup.get_text()
-
-        # Regex for emails and phones with basic filters
-        emails = set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text))
-        phones = set(re.findall(r"\+?\d[\d\s().-]{7,}\d", text))
-
-        # Exclude generic emails and obviously invalid phones
-        emails = {e for e in emails if not e.endswith('@example.com')}
-        phones = {p for p in phones if len(p) >= 8}
-    except Exception as e:
-        logging.warning(f"Contact extraction error for '{url}': {e}")
+    response = retry_request(make_request)
+    if not response:
         return [], []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    text = soup.get_text()
+
+    emails = set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text))
+    phones = set(re.findall(r"\+?\d[\d\s().-]{7,}\d", text))
+
+    # Filter out generic emails and short numbers
+    emails = {e for e in emails if not e.lower().endswith(("@example.com", "@test.com", "@email.com"))}
+    phones = {p for p in phones if len(re.sub(r"\D", "", p)) >= 8}
+
     return list(emails), list(phones)
 
-# --- Main Logic ---
-if uploaded_file is not None:
+# --- Try main + contact + about pages ---
+def get_full_contacts(website):
+    all_emails, all_phones = set(), set()
+    candidate_pages = [website]
+    for path in ["/contact", "/about", "/contact-us", "/about-us"]:
+        candidate_pages.append(urljoin(website, path))
+
+    for page in candidate_pages:
+        emails, phones = extract_contacts_from_url(page)
+        all_emails.update(emails)
+        all_phones.update(phones)
+
+    return list(all_emails), list(all_phones)
+
+# --- Main ---
+if uploaded_file:
     try:
         df = pd.read_excel(uploaded_file)
         col_option = st.selectbox("Select the column with company names:", df.columns)
@@ -108,16 +116,15 @@ if uploaded_file is not None:
             for i, company in enumerate(result_df[col_option]):
                 status.text(f"🔎 {i+1}/{total}: {company}")
                 logging.info(f"Processing [{i+1}/{total}]: {company}")
+
                 try:
                     website = get_company_website(company)
                     if website:
-                        logging.info(f"Scraping contacts from {website}")
-                        emails, phones = extract_contacts(website)
+                        emails, phones = get_full_contacts(website)
                         result_df.at[i, "Website"] = website
                         result_df.at[i, "Emails"] = ", ".join(emails) if emails else "Not Found"
                         result_df.at[i, "Phones"] = ", ".join(phones) if phones else "Not Found"
                     else:
-                        logging.info(f"Website not found for {company}")
                         result_df.at[i, "Website"] = "Not Found"
                         result_df.at[i, "Emails"] = "Not Found"
                         result_df.at[i, "Phones"] = "Not Found"
@@ -129,24 +136,18 @@ if uploaded_file is not None:
 
                 progress.progress((i + 1) / total)
 
-                # Random delay between 10 and 60 seconds after each company
-                sleep_time = random.randint(3, 8)
-                logging.info(f"Sleeping for {sleep_time} seconds.")
-                time.sleep(sleep_time)
+                # Delay to prevent blocking
+                time.sleep(random.uniform(5, 10))
 
             status.text("✅ Scraping completed!")
-            st.write(result_df)
 
-            # Export to Excel helper
             def to_excel(df):
                 output = BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                with pd.ExcelWriter(output, engine="openpyxl") as writer:
                     df.to_excel(writer, index=False)
                 return output.getvalue()
 
             file_name = f"{col_option}_contacts_scraped.xlsx"
-
-            st.success("✅ Ready for download!")
             st.download_button(
                 label="📥 Download Excel",
                 data=to_excel(result_df),
