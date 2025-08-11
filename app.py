@@ -1,450 +1,333 @@
-# ======= Team-friendly Contact Scraper for Google Colab =======
-# Paste this entire cell into a new Colab notebook and run.
-# Usage: Upload Excel -> select column -> Start. Click Stop to cancel. Download appears at the end.
-
-# Install missing libs only if necessary (keeps runs fast if already installed)
-import sys, subprocess, pkgutil
-def pip_install(pkgs):
-    subprocess.check_call([sys.executable, "-m", "pip", "install", *pkgs], stdout=subprocess.DEVNULL)
-
-for pkg in ("googlesearch-python", "beautifulsoup4", "openpyxl"):
-    if not pkgutil.find_loader(pkg.split("-")[0]):  # crude check
-        try:
-            pip_install([pkg])
-        except Exception:
-            pass  # if install fails, fallback code still tries duckduckgo
-
-# --- Imports ---
-from IPython.display import display, clear_output, HTML
-import pandas as pd, time, re, requests, random, math
+# (Full script — replace your current app file with this)
+import streamlit as st
+import pandas as pd
+import re
+import requests
 from bs4 import BeautifulSoup
+import time
+import random
+import logging
 from io import BytesIO
 from urllib.parse import urlparse, urljoin, unquote, parse_qs
 
-# try import googlesearch (may fail in some environments)
-try:
-    from googlesearch import search as google_search
-except Exception:
-    google_search = None
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ======= Configuration (sensible defaults, hidden from UI) =======
-BATCH_PAUSE_AFTER = 40          # pause after this many search attempts
-BATCH_PAUSE_MIN = 120           # pause min seconds (cooldown)
-BATCH_PAUSE_MAX = 180           # pause max seconds
-DELAY_MIN = 3.0                 # seconds between each company fetch (randomized)
-DELAY_MAX = 7.0
-DUCKDUCKGO_PAUSE = 1.0          # polite pause for DuckDuckGo query
-MAX_SEARCH_RESULTS = 6
+# --- Streamlit UI ---
+st.set_page_config(page_title="Contact Scraper (Robust)", layout="centered")
+st.title("📞 Company Contact Scraper — Robust & Patient")
+st.write("This version prefers accuracy over speed. Use SerpAPI (recommended) or the free DuckDuckGo fallback.")
 
+# --- Sidebar settings ---
+st.sidebar.header("Search & Throttling Settings")
+mode = st.sidebar.selectbox("Search mode", ["DuckDuckGo (free)", "SerpAPI (recommended)"])
+serpapi_key = st.sidebar.text_input("SerpAPI API key (optional)", type="password")
+batch_size = st.sidebar.number_input("Stop after this many searches (batch size)", min_value=10, max_value=500, value=40, step=10)
+pause_min = st.sidebar.number_input("Pause min seconds after each batch", min_value=15, max_value=3600, value=180, step=5)
+pause_max = st.sidebar.number_input("Pause max seconds after each batch", min_value=30, max_value=7200, value=300, step=5)
+delay_min = st.sidebar.number_input("Delay min (sec) between single requests", min_value=0.5, max_value=60.0, value=3.0, step=0.1, format="%.1f")
+delay_max = st.sidebar.number_input("Delay max (sec) between single requests", min_value=0.5, max_value=120.0, value=6.0, step=0.1, format="%.1f")
+search_pause = st.sidebar.slider("DuckDuckGo search pause (sec)", 0.1, 5.0, 1.0, 0.1)
+num_search_results = st.sidebar.number_input("Number of search results to consider", min_value=1, max_value=10, value=5, step=1)
+
+st.sidebar.markdown("---")
+st.sidebar.write("Tip: For best results use SerpAPI and provide an API key. Otherwise the DuckDuckGo fallback will be used (free).")
+
+uploaded_file = st.file_uploader("Upload Excel (.xlsx) with company names", type=["xlsx"])
+
+# --- User-Agent pool (expanded) ---
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:95.0) Gecko/20100101 Firefox/95.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
     "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:94.0) Gecko/20100101 Firefox/94.0",
     "Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/98.0.4758.102 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.84 Safari/537.36",
 ]
 
-BLACKLIST = ["linkedin.", "facebook.", "twitter.", "instagram.", "youtube.", "crunchbase.",
-             "glassdoor.", "yellowpages.", "yelp.", "wikipedia.", "bing.com", "google.com", "amazon."]
+# --- Helpers ---
+def to_excel_bytes(df: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False)
+    return output.getvalue()
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
-PHONE_RE = re.compile(r"\+?\d[\d\-\s().]{6,}\d")
+def clean_phone(raw: str) -> str:
+    return re.sub(r"\D", "", raw)
 
-# ======= Small UI (upload / start / stop / progress / table) =======
-upload = widgets.FileUpload(accept='.xlsx', multiple=False)
-start_btn = widgets.Button(description="▶ Start Extraction", button_style="success")
-stop_btn = widgets.Button(description="⏹ Stop", button_style="danger")
-download_btn = widgets.Button(description="⬇️ Download (when ready)", disabled=True)
-status_out = widgets.Output(layout={'border': '1px solid #ddd'})
-log_out = widgets.Output(layout={'border': '1px solid #ddd', 'height': '250px', 'overflow': 'auto'})
-progress_bar = widgets.IntProgress(value=0, min=0, max=100, description='Progress:', bar_style='info')
-table_out = widgets.Output()
+def is_blacklisted_domain(netloc: str) -> bool:
+    blacklist = ["linkedin.", "facebook.", "twitter.", "instagram.", "youtube.", "crunchbase.",
+                 "zoominfo.", "glassdoor.", "yellowpages.", "yelp.", "wikipedia.", "bing.com", "google.com", "amazon."]
+    netloc = netloc.lower()
+    return any(b in netloc for b in blacklist)
 
-controls = widgets.HBox([start_btn, stop_btn, download_btn])
-display(widgets.HTML("<h3>Company Contact Scraper — Team Edition (Colab)</h3>"))
-display(upload)
-display(controls)
-display(progress_bar)
-display(status_out)
-display(table_out)
-display(widgets.HTML("<b>Log</b>"))
-display(log_out)
-
-# Hide code in the notebook UI (makes it clean for team)
-display(HTML('''<style>
-  div.input, .prompt {display:none !important;}
-</style>'''))
-
-# ======= Globals & helpers =======
-stop_flag = False
-search_count = 0
-_last_checkpoint_df = None
-_output_filepath = "/content/Company_Contacts.xlsx"
-
-def safe_print(msg, log=True):
-    with log_out:
-        print(msg)
-
-def is_blacklisted(netloc):
-    n = (netloc or "").lower()
-    return any(b in n for b in BLACKLIST)
-
-def get_base_url(url):
+def get_base_url(url: str) -> str:
     try:
         p = urlparse(url)
-        scheme = p.scheme or "https"
-        netloc = p.netloc or urlparse("https://"+url).netloc
-        if not netloc:
-            return None
-        return f"{scheme}://{netloc}"
-    except:
+        if not p.scheme:
+            scheme = "https"
+        else:
+            scheme = p.scheme
+        if not p.netloc:
+            parsed = urlparse("https://" + url)
+            if not parsed.netloc:
+                return None
+            return f"https://{parsed.netloc}"
+        return f"{scheme}://{p.netloc}"
+    except Exception:
         return None
 
-# --- DuckDuckGo HTML search fallback (no JS) ---
-def duckduckgo_search(query, max_results=6, pause=1.0):
+# --- Search implementations ---
+def search_with_serpapi(query: str, api_key: str, num_results: int = 5):
+    """Use SerpAPI (requires API key). Returns list of urls."""
     try:
-        endpoint = "https://html.duckduckgo.com/html/"
+        params = {
+            "engine": "google",
+            "q": query,
+            "api_key": api_key,
+            "num": num_results,
+        }
+        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        urls = []
+        for r in data.get("organic_results", [])[:num_results]:
+            link = r.get("link") or r.get("url")
+            if link:
+                urls.append(link)
+        for k in ("top_results", "related_questions"):
+            for item in data.get(k, [])[:num_results]:
+                link = item.get("link") or item.get("url")
+                if link:
+                    urls.append(link)
+        seen = set()
+        out = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out[:num_results]
+    except Exception as e:
+        logging.warning(f"SerpAPI search failed: {e}")
+        return []
+
+def search_with_duckduckgo_html(query: str, num_results: int = 5, pause: float = 1.0):
+    """Simple DuckDuckGo HTML search fallback (no JS). Returns list of urls."""
+    try:
+        url = "https://html.duckduckgo.com/html/"
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         data = {"q": query}
-        resp = requests.post(endpoint, data=data, headers=headers, timeout=15)
+        resp = requests.post(url, data=data, headers=headers, timeout=15)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         links = []
-        # DuckDuckGo returns results with <a class="result__a" href="..."> or redirect like /l/?kh=-1&uddg=<url>
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if href.startswith("http"):
                 links.append(href)
             elif "uddg=" in href:
-                try:
-                    parsed = urlparse(href)
-                    qs = parse_qs(parsed.query)
-                    if "uddg" in qs:
+                parsed = urlparse(href)
+                qs = parse_qs(parsed.query)
+                if "uddg" in qs:
+                    try:
                         decoded = unquote(qs["uddg"][0])
                         links.append(decoded)
-                except:
-                    continue
-            if len(links) >= max_results:
+                    except Exception:
+                        continue
+        out = []
+        seen = set()
+        for u in links:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+            if len(out) >= num_results:
                 break
         time.sleep(pause)
-        return links[:max_results]
+        return out
     except Exception as e:
-        safe_print(f"[duckduckgo_search] failed: {e}")
+        logging.warning(f"DuckDuckGo search failed: {e}")
         return []
 
-# --- Google search wrapper (may be blocked) ---
-def google_search_candidates(query, max_results=6):
-    if google_search is None:
-        return []
-    tries = 2
-    out = []
-    for attempt in range(tries):
-        try:
-            # google_search yields URLs; use num and stop parameters commonly supported in the package
-            for u in google_search(query, num=max_results, stop=max_results, pause=2 + random.random()):
-                out.append(u)
-                if len(out) >= max_results:
-                    break
-            break
-        except Exception as e:
-            safe_print(f"[google_search] attempt {attempt+1} failed: {e}")
-            time.sleep(1 + attempt)
-    return out[:max_results]
+def get_company_search_results(company_name: str, max_results: int = 5):
+    """Wrapper that uses SerpAPI if key provided and mode set, otherwise DuckDuckGo fallback."""
+    query = f"{company_name} official website"
+    if mode == "SerpAPI (recommended)" and serpapi_key:
+        return search_with_serpapi(query, serpapi_key, num_results=max_results)
+    else:
+        return search_with_duckduckgo_html(query, num_results=max_results, pause=search_pause)
 
-# --- Search wrapper: try Google first, else DuckDuckGo ---
-def get_search_candidates(query, max_results=6):
-    # 1) Google (fast in Colab sometimes)
-    candidates = google_search_candidates(query, max_results=max_results)
-    if candidates:
-        return candidates
-    # 2) DuckDuckGo fallback
-    candidates = duckduckgo_search(query, max_results=max_results, pause=DUCKDUCKGO_PAUSE)
-    return candidates
-
-# --- Contact extraction from a page ---
-def extract_contacts_from_page(url):
-    emails, phones = set(), set()
+# --- Contact extraction ---
+def extract_contacts_from_page(url: str):
+    emails = set()
+    phones = set()
     headers = {"User-Agent": random.choice(USER_AGENTS), "Accept-Language": "en-US,en;q=0.9"}
     try:
-        r = requests.get(url, headers=headers, timeout=12)
-        if r is None or r.status_code >= 400:
+        resp = requests.get(url, headers=headers, timeout=12)
+        if resp is None or resp.status_code >= 400:
             return [], []
-        html_lower = r.text.lower()
-        for block in ("recaptcha", "unusual traffic", "please verify", "are you a robot"):
-            if block in html_lower:
-                safe_print(f"[extract] block/captcha detected on {url}")
+        html = resp.text
+        block_signs = ["unusual traffic", "recaptcha", "are you a robot", "please verify you're a human"]
+        low = html.lower()
+        for s in block_signs:
+            if s in low:
+                logging.warning(f"Possible block/captcha detected on {url}")
                 return [], []
-        soup = BeautifulSoup(r.text, "html.parser")
-        # mailto / tel links
+        soup = BeautifulSoup(html, "html.parser")
         for a in soup.find_all("a", href=True):
             href = a["href"]
             if href.startswith("mailto:"):
-                emails.add(href.split("mailto:")[1].split("?")[0].strip())
+                mail = href.split("mailto:")[1].split("?")[0]
+                emails.add(mail.strip())
             if href.startswith("tel:"):
-                phones.add(href.split("tel:")[1].split("?")[0].strip())
-        # regex fallback
+                tel = href.split("tel:")[1].split("?")[0]
+                phones.add(tel.strip())
         text = soup.get_text(" ", strip=True)
-        for e in EMAIL_RE.findall(text):
-            if not e.lower().endswith(("@example.com", "@test.com", "@email.com")):
+        found_emails = set(re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", text))
+        for e in found_emails:
+            if len(e) >= 6 and not e.lower().endswith(("@example.com", "@test.com", "@email.com")):
                 emails.add(e)
-        for p in PHONE_RE.findall(text):
+        found_phones = set(re.findall(r"\+?\d[\d\-\s().]{6,}\d", text))
+        for p in found_phones:
             digits = re.sub(r"\D", "", p)
             if len(digits) >= 8:
                 phones.add(p.strip())
     except Exception as e:
-        safe_print(f"[extract_contacts_from_page] error for {url}: {e}")
+        logging.warning(f"Contact extraction failed for {url}: {e}")
+        return [], []
     return list(emails), list(phones)
 
-def get_contacts_for_site(base_site):
+def get_full_contacts_for_site(base_site: str):
+    all_emails = set()
+    all_phones = set()
     if not base_site:
         return [], []
     candidates = [base_site]
-    for path in ("/contact", "/contact-us", "/about", "/about-us", "/team", "/support"):
+    for path in ("/contact", "/contact-us", "/about", "/about-us", "/team", "/support", "/customer-care"):
         candidates.append(urljoin(base_site, path))
-    all_emails, all_phones = set(), set()
     for page in candidates:
-        e,p = extract_contacts_from_page(page)
-        for x in e: all_emails.add(x)
-        for x in p: all_phones.add(x)
-        time.sleep(random.uniform(0.5, 1.4))
+        try:
+            emails, phones = extract_contacts_from_page(page)
+            for e in emails:
+                all_emails.add(e)
+            for p in phones:
+                all_phones.add(p)
+            time.sleep(random.uniform(0.5, 1.5))
+        except Exception as e:
+            logging.warning(f"Failed to fetch {page}: {e}")
     return list(all_emails), list(all_phones)
 
-# ======= Core loop =======
-def run_scraper(bytes_content, company_col=None):
-    global stop_flag, search_count, _last_checkpoint_df
-    stop_flag = False
-    search_count = 0
+# --- Main scraping loop ---
+if uploaded_file is not None:
     try:
-        df = pd.read_excel(BytesIO(bytes_content), engine="openpyxl")
-    except Exception as e:
-        safe_print(f"[run_scraper] failed to read Excel: {e}")
-        return None
-
-    # default column = first
-    if company_col is None:
-        company_col = df.columns[0]
-
-    # prepare result df
-    res = df.copy()
-    res["Website"] = ""
-    res["Emails"] = ""
-    res["Phones"] = ""
-    res["Status"] = ""
-
-    total = len(res)
-    with status_out:
-        clear_output(wait=True)
-        print(f"Starting scraping for {total} rows using this Colab session. Please keep this tab open.")
-
-    for i, raw_company in enumerate(res[company_col].astype(str)):
-        if stop_flag:
-            safe_print("Stopped by user.")
-            break
-
-        company = raw_company.strip()
-        with status_out:
-            clear_output(wait=True)
-            print(f"[{i+1}/{total}] Searching: {company}")
-
-        # skip empty
-        if not company:
-            res.at[i, "Website"] = "No Name"
-            res.at[i, "Status"] = "Skipped"
-            # update table
-            with table_out:
-                clear_output(wait=True)
-                display(res.head(50))
-            progress_bar.value = math.floor((i+1)/total*100)
-            continue
-
-        # Pause after batch to avoid blocks
-        if search_count > 0 and search_count % BATCH_PAUSE_AFTER == 0:
-            pause_for = random.randint(BATCH_PAUSE_MIN, BATCH_PAUSE_MAX)
-            safe_print(f"[cooldown] {search_count} searches done — pausing {pause_for}s to avoid blocking.")
-            # show countdown
-            for remain in range(pause_for, 0, -1):
-                with status_out:
-                    clear_output(wait=True)
-                    print(f"[{i+1}/{total}] Cooling down for {remain} s ...")
-                time.sleep(1)
-                if stop_flag:
-                    break
-            with status_out:
-                clear_output(wait=True)
-                print("Resuming...")
-
-        # Try searching (Google then DuckDuckGo)
-        chosen_site = None
-        search_tries = 3
-        for attempt in range(search_tries):
-            if stop_flag:
-                break
-            q = f"{company} official website"
-            candidates = get_search_candidates(q, max_results=MAX_SEARCH_RESULTS)
-            search_count += 1
-            # pick first non-blacklisted reachable base
-            for u in candidates:
-                base = get_base_url(u)
-                if not base: continue
-                parsed = urlparse(base)
-                if is_blacklisted(parsed.netloc): 
-                    continue
-                # quick reachability check
-                try:
-                    rr = requests.get(base, headers={"User-Agent": random.choice(USER_AGENTS)}, timeout=8)
-                    if rr.status_code < 400:
-                        chosen_site = base
-                        break
-                except:
-                    continue
-            if chosen_site:
-                break
-            # if none found, tweak query slightly and retry (adds company + "head office" etc)
-            time.sleep(1 + random.random())
-            if attempt == 0:
-                q = f"{company} head office official site"
-            elif attempt == 1:
-                q = f"{company} {company.split()[0]} official site"
-            else:
-                q = f"{company} website"
-        # record
-        if not chosen_site:
-            res.at[i, "Website"] = "Not Found"
-            res.at[i, "Status"] = "Site Not Found"
+        df = pd.read_excel(uploaded_file, engine="openpyxl")
+        if df.empty:
+            st.error("Uploaded file is empty.")
         else:
-            res.at[i, "Website"] = chosen_site
-            # extract contacts
-            emails, phones = get_contacts_for_site(chosen_site)
-            res.at[i, "Emails"] = ", ".join(emails) if emails else "Not Found"
-            res.at[i, "Phones"] = ", ".join(phones) if phones else "Not Found"
-            res.at[i, "Status"] = "OK" if (emails or phones) else "No Contacts"
+            col_option = st.selectbox("Select the column with company names:", df.columns)
 
-        # periodic UI updates
-        if i % 1 == 0 or i == total-1:
-            with table_out:
-                clear_output(wait=True)
-                display(res.head(100))  # show the top 100 rows for preview
-        progress_bar.value = math.floor((i+1)/total*100)
+            if st.button("Start Scraping"):
+                result_df = df.copy()
+                result_df["Website"] = ""
+                result_df["Emails"] = ""
+                result_df["Phones"] = ""
+                result_df["Status"] = ""
 
-        # checkpoint save every 10 rows
-        if i % 10 == 0 or i == total-1:
-            try:
-                res.to_excel(_output_filepath, index=False)
-                _last_checkpoint_df = res.copy()
-            except Exception as e:
-                safe_print(f"[checkpoint] failed save: {e}")
+                total = len(result_df)
+                progress = st.progress(0)
+                status = st.empty()
+                table_placeholder = st.empty()
 
-        # patient/random delay between companies
-        time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+                checkpoint_bytes = None
+                last_checkpoint_i = -1
 
-    # final save
-    try:
-        res.to_excel(_output_filepath, index=False)
-        safe_print(f"Saved final results to {_output_filepath}")
+                for i, company in enumerate(result_df[col_option]):
+                    display_company = company if pd.notna(company) else "<EMPTY>"
+                    status.text(f"🔎 {i+1}/{total}: {display_company}")
+                    logging.info(f"Processing [{i+1}/{total}]: {display_company}")
+
+                    if not (isinstance(company, str) and company.strip()):
+                        result_df.at[i, "Website"] = "Not Provided"
+                        result_df.at[i, "Emails"] = "Not Found"
+                        result_df.at[i, "Phones"] = "Not Found"
+                        result_df.at[i, "Status"] = "Skipped"
+                        if (i % 5) == 0:
+                            table_placeholder.dataframe(result_df)
+                        progress.progress(int((i + 1) / total * 100))
+                        continue
+
+                    try:
+                        search_results = get_company_search_results(company.strip(), max_results=num_search_results)
+
+                        chosen_base = None
+                        for url in search_results:
+                            base = get_base_url(url)
+                            if not base:
+                                continue
+                            parsed = urlparse(base)
+                            if is_blacklisted_domain(parsed.netloc):
+                                continue
+                            chosen_base = base
+                            break
+
+                        if not chosen_base:
+                            result_df.at[i, "Website"] = "Not Found"
+                            result_df.at[i, "Emails"] = "Not Found"
+                            result_df.at[i, "Phones"] = "Not Found"
+                            result_df.at[i, "Status"] = "Site Not Found"
+                        else:
+                            emails, phones = get_full_contacts_for_site(chosen_base)
+                            result_df.at[i, "Website"] = chosen_base
+                            result_df.at[i, "Emails"] = ", ".join(emails) if emails else "Not Found"
+                            result_df.at[i, "Phones"] = ", ".join(phones) if phones else "Not Found"
+                            result_df.at[i, "Status"] = "OK" if (emails or phones) else "No Contacts"
+
+                    except Exception as e:
+                        logging.error(f"Error scraping {company}: {e}")
+                        result_df.at[i, "Website"] = "Error"
+                        result_df.at[i, "Emails"] = "Error"
+                        result_df.at[i, "Phones"] = "Error"
+                        result_df.at[i, "Status"] = "Error"
+
+                    if (i % 2) == 0 or i == total - 1:
+                        table_placeholder.dataframe(result_df)
+
+                    progress.progress(int((i + 1) / total * 100))
+
+                    if (i % 10) == 0 or i == total - 1:
+                        checkpoint_bytes = to_excel_bytes(result_df)
+                        last_checkpoint_i = i
+
+                    time.sleep(random.uniform(delay_min, delay_max))
+
+                    if (i + 1) % batch_size == 0 and (i + 1) < total:
+                        pause_seconds = random.randint(int(pause_min), int(pause_max))
+                        status.text(f"⚠️ Completed {i+1} searches — pausing for {pause_seconds} seconds to avoid blocking...")
+                        logging.info(f"Pausing {pause_seconds}s after {i+1} searches.")
+                        for rem in range(pause_seconds, 0, -1):
+                            status.text(f"⚠️ Paused. Resuming in {rem} sec...")
+                            time.sleep(1)
+                        status.text("🔁 Resuming scraping...")
+
+                status.text("✅ Scraping completed!")
+                table_placeholder.dataframe(result_df)
+                progress.progress(100)
+
+                final_bytes = to_excel_bytes(result_df)
+                file_name = f"{col_option}_contacts_scraped.xlsx"
+
+                st.success("✅ Ready for download!")
+                st.download_button("📥 Download Excel (final)", final_bytes, file_name,
+                                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+                if checkpoint_bytes is not None and last_checkpoint_i != -1:
+                    st.info(f"Checkpoint saved at row: {last_checkpoint_i+1}")
+                    st.download_button(
+                        label="📥 Download Last Checkpoint (partial)",
+                        data=checkpoint_bytes,
+                        file_name=f"{col_option}_contacts_checkpoint_row_{last_checkpoint_i+1}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="checkpoint_download",
+                    )
+
     except Exception as e:
-        safe_print(f"Final save error: {e}")
-
-    return res
-
-# ======= Button callbacks =======
-uploaded_bytes = None
-def on_upload_change(change):
-    global uploaded_bytes
-    uploaded_bytes = None
-    if upload.value:
-        # get uploaded file bytes
-        key = list(upload.value.keys())[0]
-        uploaded_bytes = upload.value[key]['content']
-        with status_out:
-            clear_output(wait=True)
-            print(f"Uploaded: {key} — size {len(uploaded_bytes)//1024} KB")
-    else:
-        with status_out:
-            clear_output(wait=True)
-            print("No file uploaded.")
-
-def on_start_clicked(b):
-    global uploaded_bytes, stop_flag
-    if not upload.value:
-        with status_out:
-            clear_output(wait=True)
-            print("Please upload an Excel (.xlsx) file first.")
-        return
-    # simple UI for choosing column (if multiple)
-    try:
-        df_preview = pd.read_excel(BytesIO(uploaded_bytes), engine="openpyxl")
-    except Exception as e:
-        with status_out:
-            clear_output(wait=True)
-            print(f"Failed reading uploaded file: {e}")
-        return
-    cols = list(df_preview.columns)
-    if len(cols) == 0:
-        with status_out:
-            clear_output(wait=True)
-            print("Uploaded file has no columns.")
-        return
-
-    # pick column (simple single-option dialog)
-    col_selector = widgets.Dropdown(options=cols, description="Company column:")
-    ok_btn = widgets.Button(description="OK", button_style="success")
-    cancel_btn = widgets.Button(description="Cancel", button_style="warning")
-    selector_out = widgets.Output()
-
-    def on_ok(c):
-        selector_out.clear_output()
-        with selector_out:
-            print("Starting... (this cell will show live progress)")
-        start_btn.disabled = True
-        stop_btn.disabled = False
-        # run scraper in blocking fashion (Colab will execute here)
-        res = run_scraper(uploaded_bytes, company_col=col_selector.value)
-        start_btn.disabled = False
-        stop_btn.disabled = True
-        if res is not None:
-            download_btn.disabled = False
-            with status_out:
-                clear_output(wait=True)
-                print("Scraping completed. Use Download button to get the file.")
-        else:
-            with status_out:
-                clear_output(wait=True)
-                print("Scraping ended with errors; check logs for hints.")
-
-    def on_cancel(c):
-        selector_out.clear_output()
-        with status_out:
-            clear_output(wait=True)
-            print("Cancelled start.")
-
-    ok_btn.on_click(on_ok)
-    cancel_btn.on_click(on_cancel)
-    with status_out:
-        clear_output(wait=True)
-        display(widgets.HBox([col_selector, ok_btn, cancel_btn]), selector_out)
-
-def on_stop_clicked(b):
-    global stop_flag
-    stop_flag = True
-    with status_out:
-        clear_output(wait=True)
-        print("Stop requested — will halt after current request completes.")
-
-def on_download_clicked(b):
-    try:
-        files.download(_output_filepath)
-    except Exception as e:
-        safe_print(f"Download failed: {e}")
-
-# bind
-upload.observe(on_upload_change, names='value')
-start_btn.on_click(on_start_clicked)
-stop_btn.on_click(on_stop_clicked)
-download_btn.on_click(on_download_clicked)
-
-# initial hints
-with status_out:
-    clear_output(wait=True)
-    print("Upload an Excel (.xlsx) file and press Start. Each team member should run their own Colab session.")
-with log_out:
-    clear_output(wait=True)
-    print("Log starts here. Errors & important notices will appear in this box.")
+        logging.error(f"Unexpected error during scraping: {e}")
+        st.error(f"❌ Unexpected error: {e}")
