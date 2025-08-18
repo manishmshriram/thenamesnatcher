@@ -15,7 +15,7 @@ stop_flag = False
 def stop_search():
     global stop_flag
     stop_flag = True
-    st.warning("⛔ Search stopped by user.")
+    st.warning("⛔ Search stopped by user. Partial results will be available for download.")
 
 # ---- CONTACT SCRAPER ----
 def extract_contacts(company):
@@ -26,7 +26,7 @@ def extract_contacts(company):
             if stop_flag:
                 break
             try:
-                response = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+                response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
                 if response.status_code != 200:
                     continue
                 soup = BeautifulSoup(response.text, "html.parser")
@@ -65,6 +65,7 @@ def run_scraper(uploaded_file):
         emails, phones, error = extract_contacts(company)
 
         results.append({
+            "Row": idx + 1,  # Keep track of row number
             "Company": company,
             "Emails": ", ".join(emails) if emails else "Not Found",
             "Phones": ", ".join(phones) if phones else "Not Found",
@@ -74,7 +75,7 @@ def run_scraper(uploaded_file):
         # Adaptive delay (between 3-6 seconds)
         time.sleep(random.uniform(3, 6))
 
-        progress.progress((idx+1)/total)
+        progress.progress((idx + 1) / total)
 
     return pd.DataFrame(results)
 
@@ -91,6 +92,8 @@ if uploaded_file:
         with st.spinner("Extracting contacts... Please wait."):
             result_df = run_scraper(uploaded_file)
 
+            st.write(f"**✅ Processed Rows: {len(result_df)}**")  # Row counter
+
             # Auto-download Excel file
             output = BytesIO()
             result_df.to_excel(output, index=False)
@@ -100,4 +103,8 @@ if uploaded_file:
                 file_name="contact_results.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-            st.success("✅ Extraction Completed!")
+
+            if stop_flag:
+                st.warning("⚠️ Process stopped early. Download contains partial results.")
+            else:
+                st.success("✅ Extraction Completed!")
