@@ -8,13 +8,13 @@ import time
 import random
 from io import BytesIO
 
-# ---- GLOBAL VARIABLES ----
-stop_flag = False
+# ---- SESSION STATE FOR STOP FLAG ----
+if "stop_flag" not in st.session_state:
+    st.session_state.stop_flag = False
 
 # ---- STOP FUNCTION ----
 def stop_search():
-    global stop_flag
-    stop_flag = True
+    st.session_state.stop_flag = True
     st.warning("⛔ Search stopped by user. Partial results will be available for download.")
 
 # ---- CONTACT SCRAPER ----
@@ -23,7 +23,7 @@ def extract_contacts(company):
     try:
         urls = search(f"{company} Contact OR About", num_results=3)  # 3 links for balance
         for url in urls:
-            if stop_flag:
+            if st.session_state.stop_flag:
                 break
             try:
                 response = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
@@ -48,24 +48,26 @@ def extract_contacts(company):
 
 # ---- MAIN FUNCTION ----
 def run_scraper(uploaded_file):
-    global stop_flag
-    stop_flag = False
+    st.session_state.stop_flag = False
 
     df = pd.read_excel(uploaded_file)
     results = []
 
     progress = st.progress(0)
+    status_text = st.empty()
     total = len(df)
 
     for idx, row in df.iterrows():
-        if stop_flag:
+        if st.session_state.stop_flag:
             break
 
         company = str(row[0])
+        status_text.write(f"🔎 Processing row {idx+1} of {total}: **{company}**")
+
         emails, phones, error = extract_contacts(company)
 
         results.append({
-            "Row": idx + 1,  # Keep track of row number
+            "Row": idx + 1,
             "Company": company,
             "Emails": ", ".join(emails) if emails else "Not Found",
             "Phones": ", ".join(phones) if phones else "Not Found",
@@ -92,7 +94,7 @@ if uploaded_file:
         with st.spinner("Extracting contacts... Please wait."):
             result_df = run_scraper(uploaded_file)
 
-            st.write(f"**✅ Processed Rows: {len(result_df)}**")  # Row counter
+            st.write(f"**✅ Processed Rows: {len(result_df)}**")
 
             # Auto-download Excel file
             output = BytesIO()
@@ -104,7 +106,7 @@ if uploaded_file:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-            if stop_flag:
+            if st.session_state.stop_flag:
                 st.warning("⚠️ Process stopped early. Download contains partial results.")
             else:
                 st.success("✅ Extraction Completed!")
