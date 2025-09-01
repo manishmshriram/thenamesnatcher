@@ -90,9 +90,28 @@ def extract_emails(text: str, domain: str) -> List[str]:
 def extract_phones(text: str) -> List[str]:
     if not text:
         return []
-    regex = re.compile(r"(?:\+\d{1,3}[\s-]?)?(?:\(?\d{2,4}\)?[\s-]?)?\d{3,4}[\s-]?\d{3,4}")
-    found = {m.group(0) for m in regex.finditer(text)}
-    return list(found)
+    
+    # Regex: captures international (+XX) or local numbers with common separators
+    regex = re.compile(r"(?:\+\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)?\d{3,4}[\s.-]?\d{3,4}")
+    found = {m.group(0).strip() for m in regex.finditer(text)}
+    
+    cleaned = []
+    for num in found:
+        digits = re.sub(r"\D", "", num)  # keep only digits
+        # valid if length between 10–15 digits (most real phone numbers)
+        if 10 <= len(digits) <= 15:
+            normalized = re.sub(r"[\s.-]+", " ", num).strip()
+            cleaned.append(normalized)
+    
+    # Deduplicate while preserving order
+    seen = set()
+    result = []
+    for num in cleaned:
+        if num not in seen:
+            seen.add(num)
+            result.append(num)
+    
+    return result
 
 
 def scrape_company(company: str) -> Dict[str, str]:
