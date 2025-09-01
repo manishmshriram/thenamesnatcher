@@ -173,3 +173,10 @@ if st.session_state.results is not None and not st.session_state.results.empty:
         "⬇ Download results", buf.getvalue(), "contact_results.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+# --- RESET BUTTON ---
+if st.button("🔄 Reset"):
+    for key in ["uploaded_file", "results", "progress", "stop_flag"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.experimental_rerun()
+
