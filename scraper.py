@@ -1,34 +1,25 @@
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.options import Options
+from serpapi import GoogleSearch
 import requests
 from bs4 import BeautifulSoup
 import re
-import time
-import chromedriver_autoinstaller
-chromedriver_autoinstaller.install()
 
+SERPAPI_API_KEY = "YOUR_API_KEY_HERE"  # Replace with your actual key
 
 def get_company_website(company_name):
-    query = f"{company_name} official site"
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    driver = webdriver.Chrome(options=options)
-
-    driver.get(f"https://www.google.com/search?q={query}")
-    time.sleep(2)
+    params = {
+        "engine": "google",
+        "q": f"{company_name} official site",
+        "api_key": SERPAPI_API_KEY
+    }
 
     try:
-        result = driver.find_element(By.CSS_SELECTOR, 'div.yuRUbf > a')
-        url = result.get_attribute('href')
+        search = GoogleSearch(params)
+        results = search.get_dict()
+        if "organic_results" in results and results["organic_results"]:
+            return results["organic_results"][0]["link"]
     except Exception as e:
-        print(f"Error finding website for {company_name}: {e}")
-        url = None
-
-    driver.quit()
-    return url
+        print(f"Error with SerpAPI for {company_name}: {e}")
+    return None
 
 def extract_contacts(url):
     emails, phones = set(), set()
@@ -43,4 +34,3 @@ def extract_contacts(url):
     except Exception as e:
         print(f"Error fetching {url}: {e}")
     return list(emails), list(phones)
-
