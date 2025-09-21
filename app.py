@@ -1,198 +1,392 @@
+"""
+Streamlit Contact Scraper (production-friendly)
+
+How to use:
+1) Install dependencies: pip install streamlit pandas requests beautifulsoup4 openpyxl
+2) Run locally: streamlit run streamlit_contact_scraper.py
+3) (Optional) Provide a SerpAPI key in the sidebar for robust website search (recommended for production).
+
+Notes:
+- This app uses multiple techniques to locate the official website: SerpAPI (if provided), googlesearch (if installed), and DuckDuckGo HTML fallback.
+- Scraping is parallelized with a bounded ThreadPoolExecutor. Per-domain polite delays, randomized user-agents and retries help reduce blocking.
+- Still: scraping other sites can be blocked. For the most reliable production behavior use a paid search API (SerpAPI/Google Custom Search).
+
+Author: Generated for Manish
+"""
+
 import streamlit as st
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urljoin, urlparse
 import random
+import requests
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin, urlparse, quote_plus
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import io
 
-# UTILITIES
-
-EMAIL_REGEX = r"(?:[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-zA-Z0-9!#$%&'*+/=?^_`{|}~-]+)*|\"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*\")@(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}"
-PHONE_REGEX = r"(?:\+\d{1,3}\s*)?(?:\(?\d{2,5}\)?\s*|\d{2,5}\s*)(?:[\s\-]?\d{3,5}){2,3}"
-
+# -------------------------- Configuration / constants --------------------------
 USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64)...",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)...",
-    # Add several realistic user-agent strings
+    # A short list of commonly-used desktop user agents. Rotate these.
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
 ]
 
-# Use your Google API key if available, otherwise fallback to scraping Google SERP
-GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"] if "GOOGLE_API_KEY" in st.secrets else None
-GOOGLE_CSE_ID = st.secrets["GOOGLE_CSE_ID"] if "GOOGLE_CSE_ID" in st.secrets else None
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
+PHONE_RE = re.compile(r"(\+\d{1,3}[\s\-]?)?\(?\d{2,4}\)?[\s\-]?\d{3,4}[\s\-]?\d{3,4}")
+
+# Avoid scraping these aggregator domains when guessing website
+AGGREGATOR_DOMAIN_PARTS = [
+    "linkedin", "facebook", "crunchbase", "glassdoor", "yellowpages", "yelp", "wikipedia",
+]
+
+# -------------------------- Utility functions --------------------------
+
+def create_session(timeout=10):
+    """Create a requests.Session with retry strategy."""
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=0.7, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
+    session.timeout = timeout
+    return session
+
 
 @st.cache_data(show_spinner=False)
-def cached_scrape(url):
-    headers = {"User-Agent": random.choice(USER_AGENTS)}
+def normalize_company_name(name: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z ]+", " ", str(name)).strip()
+
+
+# -------------------------- Website discovery --------------------------
+
+@st.cache_data(show_spinner=False)
+def find_website_serpapi(company: str, serpapi_key: str):
+    """Try SerpAPI (most robust) if user provides a key."""
     try:
-        resp = requests.get(url, headers=headers, timeout=12)
-        resp.raise_for_status()
-        return resp.text
-    except Exception:
-        return ""
-
-def extract_contacts(text):
-    emails = list(set(re.findall(EMAIL_REGEX, text, re.IGNORECASE)))
-    phones = list(set(re.findall(PHONE_REGEX, text)))
-    return emails, phones
-
-def get_contact_links(base_url, soup):
-    links = set()
-    for link in soup.find_all('a', href=True):
-        href = link['href']
-        for kw in ['contact', 'about']:
-            if kw in href.lower():
-                full_url = urljoin(base_url, href)
-                links.add(full_url)
-    return list(links)
-
-def search_official_website(company_name):
-    if GOOGLE_API_KEY and GOOGLE_CSE_ID:
-        url = "https://www.googleapis.com/customsearch/v1"
         params = {
-            "key": GOOGLE_API_KEY,
-            "cx": GOOGLE_CSE_ID,
-            "q": company_name,
-            "num": 3
+            "engine": "google",
+            "q": f"{company} official site",
+            "api_key": serpapi_key,
+            "num": 5,
         }
-        response = requests.get(url, params=params)
-        if response.status_code == 200:
-            results = response.json().get("items", [])
-            for result in results:
-                site = result.get("link", "")
-                if site and not re.search(r"(linkedin|crunchbase|facebook|twitter|instagram|wikipedia)", site, re.I):
-                    return site
-    else:
-        # Fallback: scrape Google (unstable, use a paid API for production where possible)
-        query = f"{company_name} official site"
-        url = "https://www.google.com/search"
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        params = {"q": query}
-        try:
-            resp = requests.get(url, headers=headers, params=params, timeout=12)
-            soup = BeautifulSoup(resp.text, "html.parser")
-            for cite in soup.select("a"):
-                href = cite.get("href", "")
-                if href.startswith("http") and not re.search(r"(linkedin|crunchbase|facebook|twitter|instagram|wikipedia)", href, re.I):
-                    netloc = urlparse(href).netloc
-                    if netloc and not netloc.endswith("google.com"):
-                        return href
-        except Exception:
-            return ""
-    return ""
+        resp = requests.get("https://serpapi.com/search.json", params=params, timeout=10)
+        data = resp.json()
+        # serpapi returns `organic_results`
+        for item in data.get("organic_results", []):
+            link = item.get("link") or item.get("url")
+            if link:
+                # prefer a link that looks like the official site (not linkedin etc.)
+                if not any(p in link for p in AGGREGATOR_DOMAIN_PARTS):
+                    return link
+        # fallback to first organic
+        if data.get("organic_results"):
+            return data["organic_results"][0].get("link")
+    except Exception:
+        return None
+    return None
 
-def scrape_company_info(company):
-    time.sleep(random.uniform(1.5, 3.5))  # Pause to avoid rate-limiting
-    website = search_official_website(company)
-    if not website:
-        return {"Company": company, "Website": "Not Found", "Emails": "Not Found", "Phones": "Not Found"}
-    raw_html = cached_scrape(website)
-    emails, phones = extract_contacts(raw_html)
+
+@st.cache_data(show_spinner=False)
+def find_website_duckduckgo(company: str):
+    """Fallback search using DuckDuckGo HTML front-end and parse links.
+    This is best-effort and may break if DuckDuckGo changes markup.
+    """
     try:
-        soup = BeautifulSoup(raw_html, "html.parser")
-        contact_links = get_contact_links(website, soup)
-        for link in contact_links[:3]:
-            html = cached_scrape(link)
-            e2, p2 = extract_contacts(html)
-            emails.extend(e2)
-            phones.extend(p2)
+        query = quote_plus(f"{company} official site")
+        url = f"https://duckduckgo.com/html/?q={query}"
+        session = create_session()
+        resp = session.get(url, timeout=10)
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # look for external links
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            # duckduckgo uses /l/?kh=1&uddg=<urlencoded-url> sometimes
+            if "uddg=" in href:
+                # extract last param
+                parsed = href.split("uddg=")[-1]
+                try:
+                    candidate = requests.utils.unquote(parsed)
+                except Exception:
+                    candidate = parsed
+            elif href.startswith("http"):
+                candidate = href
+            else:
+                continue
+            # filter out aggregators
+            if any(p in candidate for p in AGGREGATOR_DOMAIN_PARTS):
+                continue
+            return candidate
+    except Exception:
+        return None
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def find_website_googlesearch(company: str):
+    """Try the `googlesearch` python library (if installed in the environment).
+    Not guaranteed in all deployments; provided as an optional extra.
+    """
+    try:
+        from googlesearch import search
+        query = f"{company} official site"
+        for url in search(query, num=5, stop=5, pause=1.5):
+            if not any(p in url for p in AGGREGATOR_DOMAIN_PARTS):
+                return url
+    except Exception:
+        return None
+    return None
+
+
+def find_website(company: str, serpapi_key: str | None):
+    """Top-level website lookup: SerpAPI -> googlesearch -> DuckDuckGo fallback
+    Cached wrappers above will limit re-requests.
+    """
+    company = normalize_company_name(company)
+    if serpapi_key:
+        result = find_website_serpapi(company, serpapi_key)
+        if result:
+            return result
+    # try googlesearch package
+    try:
+        result = find_website_googlesearch(company)
+        if result:
+            return result
     except Exception:
         pass
-    emails = list(set(emails))
-    phones = list(set(phones))
+    # finally ddg fallback
+    result = find_website_duckduckgo(company)
+    return result
+
+
+# -------------------------- Contact extraction --------------------------
+
+@st.cache_data(show_spinner=False)
+def extract_contacts_from_url(url: str, max_pages: int = 3, timeout: int = 8):
+    """Given a starting URL (homepage), fetch page and candidate 'contact/about' pages and extract emails/phones.
+    Caching helps if multiple companies share domains.
+    """
+    session = create_session(timeout=timeout)
+    emails = set()
+    phones = set()
+
+    def try_fetch(u):
+        try:
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            r = session.get(u, headers=headers, timeout=timeout)
+            if r.status_code == 200 and r.text:
+                return r.text
+        except Exception:
+            return None
+        return None
+
+    # Normalize URL
+    parsed = urlparse(url)
+    if not parsed.scheme:
+        url = "http://" + url
+
+    # 1) Try homepage
+    front = try_fetch(url)
+    if front:
+        soup = BeautifulSoup(front, "html.parser")
+        text = soup.get_text(" ")
+        emails.update(EMAIL_RE.findall(text))
+        phones.update(PHONE_RE.findall(text))
+        # mailto links
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.startswith("mailto:"):
+                addr = href.split("mailto:")[-1].split("?")[0]
+                if EMAIL_RE.match(addr):
+                    emails.add(addr)
+
+        # find candidate contact/about links
+        candidates = []
+        for a in soup.find_all("a", href=True):
+            href = a["href"].lower()
+            if any(k in href for k in ["/contact", "contactus", "contact-us", "about", "about-us", "support", "help", "reach-us"]):
+                full = urljoin(url, a["href"])
+                candidates.append(full)
+
+        # Deduplicate and limit
+        candidates = list(dict.fromkeys(candidates))[:max_pages]
+
+        # visit candidate pages
+        for c in candidates:
+            time.sleep(random.uniform(0.3, 1.0))
+            page = try_fetch(c)
+            if page:
+                s2 = BeautifulSoup(page, "html.parser")
+                t2 = s2.get_text(" ")
+                emails.update(EMAIL_RE.findall(t2))
+                phones.update(PHONE_RE.findall(t2))
+                for a in s2.find_all("a", href=True):
+                    href = a["href"]
+                    if href.startswith("mailto:"):
+                        addr = href.split("mailto:")[-1].split("?")[0]
+                        if EMAIL_RE.match(addr):
+                            emails.add(addr)
+    # Post-process phones: PHONE_RE returns tuples; flatten
+    phone_strings = set()
+    for p in phones:
+        if isinstance(p, tuple):
+            phone_strings.add("".join(p))
+        else:
+            phone_strings.add(p)
+
+    # clean results
+    clean_emails = sorted({e.strip().lower() for e in emails})
+    clean_phones = sorted({re.sub(r"\s+", " ", p).strip() for p in phone_strings})
+    return clean_emails, clean_phones
+
+
+# -------------------------- Worker & orchestration --------------------------
+
+def process_company(company: str, serpapi_key: str | None, per_request_delay_range=(0.3, 1.0)):
+    """Full pipeline for a single company: find website then extract contacts."""
+    company_norm = normalize_company_name(company)
+    website = find_website(company_norm, serpapi_key)
+    # polite random delay before scraping target site
+    time.sleep(random.uniform(*per_request_delay_range))
+    emails, phones = ([], [])
+    if website:
+        try:
+            emails, phones = extract_contacts_from_url(website)
+        except Exception:
+            emails, phones = ([], [])
+    else:
+        website = "Not Found"
     return {
         "Company": company,
         "Website": website,
-        "Emails": ", ".join(emails) if emails else "Not Found",
-        "Phones": ", ".join(phones) if phones else "Not Found"
+        "Emails": "; ".join(emails) if emails else "",
+        "Phones": "; ".join(phones) if phones else "",
     }
 
-# ---- STREAMLIT UI ----
 
-st.set_page_config(page_title="Company Contact Scraper", layout="wide", initial_sidebar_state="expanded")
+# -------------------------- Streamlit UI --------------------------
 
+st.set_page_config(page_title="Company Contact Scraper", layout="wide")
+st.title("Company Contact Scraper — Streamlined for Team Use")
 st.markdown(
-    """
-    <style>
-    .stApp { background-color: #f6f8fa; }
-    .css-1cpxqw2 { font-family: 'Inter', sans-serif; }
-    .stButton>button { background-color: #244E6A; color: white; font-weight: 600; }
-    </style>
-    """,
-    unsafe_allow_html=True,
+    "Simple, production-minded Streamlit app to locate company websites and extract emails & phone numbers. For best reliability provide a SerpAPI key in the sidebar (optional)."
 )
-st.title("Company Contact Scraper 🏢")
-st.write("Upload a CSV/Excel file of company names. The app will find official company sites and extract emails/phones from their web pages. [Production Ready]")
 
-# Upload Section
-uploaded_file = st.file_uploader("Upload Excel or CSV (with company names)", type=["csv", "xlsx"], key="uploader", help="Make sure your file has a column for company names.")
-reset_trigger = st.button("Reload / Reset", key="reset_button")
+# Sidebar settings
+with st.sidebar:
+    st.header("Settings")
+    serpapi_key = st.text_input("SerpAPI API key (optional)", type="password")
+    max_workers = st.number_input("Max parallel workers (threads)", min_value=1, max_value=20, value=6, step=1)
+    per_request_min = st.number_input("Min per-site delay (s)", min_value=0.0, max_value=10.0, value=0.3, step=0.1)
+    per_request_max = st.number_input("Max per-site delay (s)", min_value=0.0, max_value=10.0, value=1.0, step=0.1)
+    timeout = st.number_input("HTTP timeout (s)", min_value=2, max_value=60, value=10, step=1)
+    max_pages_to_check = st.number_input("Max contact/about pages to visit per site", min_value=1, max_value=10, value=3, step=1)
+    st.markdown("---")
+    st.caption("Tip: For heavier usage, use SerpAPI (paid) for reliable search results and fewer blocks.")
 
-# Keep session state for results
-if 'results' not in st.session_state or reset_trigger:
-    st.session_state.results = None
-    st.session_state.df = None
+
+# File upload and reload/reset
+uploaded_file = st.file_uploader("Upload Excel or CSV with company names (first column by default)", type=["xlsx", "xls", "csv"], accept_multiple_files=False)
+if "df_uploaded" not in st.session_state:
+    st.session_state.df_uploaded = None
+
+if st.button("Reload / Reset"):
+    st.session_state.df_uploaded = None
+    st.experimental_rerun()
 
 if uploaded_file is not None:
     try:
-        if uploaded_file.name.endswith(".csv"):
+        if uploaded_file.name.lower().endswith(".csv"):
             df = pd.read_csv(uploaded_file)
         else:
             df = pd.read_excel(uploaded_file)
-    except Exception:
-        st.error("Could not parse file. Please check file format and columns.")
+    except Exception as e:
+        st.error(f"Could not read the uploaded file: {e}")
         st.stop()
 
-    # Detect company column
-    company_col = None
-    for col in df.columns:
-        if "company" in col.lower():
-            company_col = col
-            break
-    if company_col is None:
-        st.error("No column labelled for company names. Please check your file.")
+    st.session_state.df_uploaded = df
+
+# If no file in session state, show placeholder and stop
+if st.session_state.df_uploaded is None:
+    st.info("Upload a file to begin. You can upload an Excel/CSV file with a column of company names.")
+    st.stop()
+
+# file loaded
+df_in = st.session_state.df_uploaded.copy()
+st.subheader("Preview of uploaded data")
+st.dataframe(df_in.head())
+
+# Ask user which column contains company names
+col_options = list(df_in.columns)
+company_col = st.selectbox("Which column contains company names?", options=col_options, index=0)
+companies = df_in[company_col].astype(str).fillna("").tolist()
+
+start = st.button("Start Scraping")
+
+if start:
+    if not companies:
+        st.error("No companies found in the selected column.")
         st.stop()
 
-    companies = df[company_col].dropna().astype(str).unique().tolist()
-    st.info(f"Found {len(companies)} unique companies to process.")
+    # prepare results DataFrame
+    results = []
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    results_area = st.empty()
 
-    # Main scraping logic – multiparallel for efficiency
-    MAX_THREADS = min(12, len(companies))
-    task_state = st.empty()
-    results_list = []
-    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-        future_to_company = {executor.submit(scrape_company_info, company): company for company in companies}
-        for i, future in enumerate(as_completed(future_to_company), 1):
-            result = future.result()
-            results_list.append(result)
-            task_state.info(f"Processed {i}/{len(companies)} companies.")
+    total = len(companies)
+    completed = 0
 
-    st.session_state.results = results_list
-    st.session_state.df = pd.DataFrame(results_list)
+    # We'll use ThreadPoolExecutor with bounded workers
+    with ThreadPoolExecutor(max_workers=int(max_workers)) as executor:
+        futures = {}
+        for idx, company in enumerate(companies):
+            futures[executor.submit(process_company, company, serpapi_key, (per_request_min, per_request_max))] = (idx, company)
 
-if st.session_state.results:
-    st.success("Scraping Complete!")
-    st.dataframe(st.session_state.df)
+        for fut in as_completed(futures):
+            idx, company = futures[fut]
+            try:
+                row = fut.result()
+            except Exception as e:
+                row = {"Company": company, "Website": "Error", "Emails": "", "Phones": ""}
+            results.append(row)
+            completed += 1
+            progress_bar.progress(completed / total)
+            status_text.text(f"Processed {completed} of {total}: {company}")
+            # show an updating table — show most recent results on top
+            df_results = pd.DataFrame(results)
+            results_area.dataframe(df_results)
 
-    # Download Output
-    output = st.session_state.df
-    output_file = output.to_excel(index=False, engine="openpyxl")
-    st.download_button(
-        "Download Results (Excel file)",
-        data=output_file,
-        file_name="company_contacts.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    # final table
+    df_results = pd.DataFrame(results)
+    st.success("Scraping complete")
+    st.dataframe(df_results)
 
-    st.caption("Company | Website | Emails | Phones. Enjoy your contact leads!")
+    # Merge back into original file (append columns)
+    out_df = df_in.copy()
+    out_df["_scraper_website"] = df_results["Website"]
+    out_df["_scraper_emails"] = df_results["Emails"]
+    out_df["_scraper_phones"] = df_results["Phones"]
 
-# Deployment extra for platforms like Render/Heroku
-import os
-if "0.0.0.0" in os.environ.get("BIND_ON", ""):
-    from streamlit.web import cli as stcli
-    if __name__ == "__main__":
-        import sys
-        sys.argv = ["streamlit", "run", sys.argv[0], "--server.address=0.0.0.0", "--server.port=8501"]
-        sys.exit(stcli.main())
+    # Provide download as excel
+    towrite = io.BytesIO()
+    with pd.ExcelWriter(towrite, engine="openpyxl") as writer:
+        out_df.to_excel(writer, index=False, sheet_name="contacts")
+    towrite.seek(0)
+    st.download_button("Download results as Excel", data=towrite, file_name="Company_Contacts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    # Also provide CSV
+    st.download_button("Download results as CSV", data=out_df.to_csv(index=False).encode("utf-8"), file_name="Company_Contacts.csv", mime="text/csv")
+
+    st.markdown("---")
+    st.info("If you plan to run this often or for large lists, consider using SerpAPI and/or increasing polite delays to reduce blocks.")
+
+    st.balloons()
+
+# End of app
