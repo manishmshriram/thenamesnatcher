@@ -58,6 +58,12 @@ if uploaded_file is not None:
     company_column = df.columns[0]
 
     results = []
+df = pd.read_excel(uploaded_file)
+
+# Take the first column name dynamically
+company_column = df.columns[0]  
+
+results = []
 progress_text = st.empty()
 progress_bar = st.progress(0)
 
@@ -66,6 +72,7 @@ for i, company in enumerate(df[company_column]):
     contacts = scrape_contacts(company)
     results.extend(contacts)
     progress_bar.progress((i + 1) / len(df))
+
 
 
     if results:
