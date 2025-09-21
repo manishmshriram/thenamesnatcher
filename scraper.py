@@ -5,6 +5,9 @@ import requests
 from bs4 import BeautifulSoup
 import re
 import time
+import chromedriver_autoinstaller
+chromedriver_autoinstaller.install()
+
 
 def get_company_website(company_name):
     query = f"{company_name} official site"
@@ -40,3 +43,4 @@ def extract_contacts(url):
     except Exception as e:
         print(f"Error fetching {url}: {e}")
     return list(emails), list(phones)
+
