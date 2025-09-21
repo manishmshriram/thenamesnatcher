@@ -58,13 +58,15 @@ if uploaded_file is not None:
     company_column = df.columns[0]
 
     results = []
-    progress = st.progress(0)
+   progress_text = st.empty()
+progress_bar = st.progress(0)
 
-    for i, company in enumerate(df[company_column]):
-        st.write(f"🔍 Processing: {company}")
-        contacts = scrape_contacts(company)
-        results.extend(contacts)
-        progress.progress((i + 1) / len(df))
+for i, company in enumerate(df[company_column]):
+    progress_text.text(f"🔍 Processing {i+1}/{len(df)}: {company}")
+    contacts = scrape_contacts(company)
+    results.extend(contacts)
+    progress_bar.progress((i + 1) / len(df))
+
 
     if results:
         output_df = pd.DataFrame(results)
