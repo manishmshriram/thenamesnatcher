@@ -1,6 +1,6 @@
 streamlit
 pandas
-openpyxl
 requests
 beautifulsoup4
-google-search-results
+duckduckgo_search
+openpyxl
