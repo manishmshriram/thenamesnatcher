@@ -2,22 +2,15 @@
 Streamlit Contact Scraper (Colab-style, accurate)
 
 What this file does
-- Replace googlesearch (which often triggers "line 7" import errors) with duckduckgo_search.
 - Accepts a single company name or a bulk CSV/XLSX upload (one column with company names).
-- For each company it searches top results, visits candidate pages (contact/about/home), extracts emails and phone numbers (also mailto: and tel: links), and collects them into a DataFrame.
+- For each company it searches top results (DuckDuckGo), visits candidate pages (contact/about/home), extracts emails and phone numbers, and collects them into a DataFrame.
 - Lets you download the final results as an Excel (.xlsx) or CSV.
 
 Install (one-liner):
-    pip install streamlit pandas requests beautifulsoup4 duckduckgo_search openpyxl
+    pip install -r requirements.txt
 
 Run:
-    streamlit run streamlit_contact_scraper_app.py
-
-Notes / tips:
-- This app deliberately leans toward the "Colab slow-but-accurate" approach: you can configure number of search results per company and delay range between requests.
-- If you upload 150–200 companies, expect the runtime to scale linearly. You can speed up by lowering `max_results` and `min_delay`/`max_delay` in the UI.
-- If you previously got an error at "line 7" in older code, it was likely `from googlesearch import search`. That's replaced here with `from duckduckgo_search import ddg` to avoid that import issue.
-
+    streamlit run app.py
 """
 
 import streamlit as st
@@ -28,7 +21,7 @@ import time
 import random
 import io
 from bs4 import BeautifulSoup
-from duckduckgo_search import ddg
+from duckduckgo_search import DDGS
 from urllib.parse import urlparse
 
 # -------------------------- Utility functions --------------------------
@@ -85,53 +78,25 @@ def extract_contacts_from_html(soup):
 # -------------------------- Core scraping functions --------------------------
 
 def find_candidate_urls(company, max_results=8):
-    """Use DuckDuckGo to get candidate pages for the company. Returns unique URLs with contact/about prioritized."""
+    """Use DuckDuckGo to get candidate pages for the company."""
     query = f"{company} contact OR about OR \"contact us\" OR \"about us\""
-    try:
-        results = ddg(query, max_results=max_results) or []
-    except Exception:
-        results = []
-
     urls = []
     seen = set()
-    # ddg returns list of dicts with 'href' key in many installs; sometimes 'url' or 'link' -> handle both
-    for r in results:
-        url = r.get('href') or r.get('url') or r.get('link') or ''
-        if not url:
-            continue
-        domain = get_domain(url)
-        if domain in seen:
-            continue
-        seen.add(domain)
-        urls.append(url)
-
-    # Add the root domain URLs as fallback (e.g., https://company.com)
-    root_urls = []
-    for u in urls:
-        try:
-            p = urlparse(u)
-            root = f"{p.scheme}://{p.netloc}" if p.scheme else f"https://{p.netloc}"
-            if root not in seen:
-                root_urls.append(root)
-                seen.add(root)
-        except Exception:
-            pass
-
-    # prioritize URLs that likely contain contact info
-    prioritized = [u for u in urls if 'contact' in u.lower() or 'about' in u.lower()]
-    others = [u for u in urls if u not in prioritized]
-    final = prioritized + others + root_urls
-
-    # ensure uniqueness
-    unique_final = []
-    seen2 = set()
-    for u in final:
-        if u in seen2:
-            continue
-        seen2.add(u)
-        unique_final.append(u)
-
-    return unique_final[:max_results]
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(query, max_results=max_results)
+            for r in results:
+                url = r.get("href") or r.get("url") or r.get("link") or ""
+                if not url:
+                    continue
+                domain = get_domain(url)
+                if domain in seen:
+                    continue
+                seen.add(domain)
+                urls.append(url)
+    except Exception:
+        pass
+    return urls
 
 
 def extract_contacts(url, session, headers):
@@ -251,8 +216,8 @@ if start:
         st.download_button('Download Excel (.xlsx)', data=output, file_name='company_contacts.xlsx', mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
         # small summary
-        total_emails = df_out['Emails'].str.len().sum() if 'Emails' in df_out.columns else 0
-        st.write(f'Companies scraped: {total} — Rows with at least one contact: {(df_out[['Emails','Phones']].apply(lambda r: bool(r['Emails'] or r['Phones']), axis=1)).sum()}')
+        total_with_contacts = (df_out[['Emails','Phones']].apply(lambda r: bool(r['Emails'] or r['Phones']), axis=1)).sum()
+        st.write(f'Companies scraped: {total} — Rows with at least one contact: {total_with_contacts}')
 
         st.info('Tip: If you upload a large list (150-200 names), consider reducing "Max search results" and delay values to speed up the run. You can also run this in Colab or a cloud VM if you want uninterrupted long runs.')
 
