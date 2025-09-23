@@ -1,38 +1,57 @@
-# app.py
 import streamlit as st
 import pandas as pd
+import requests
+import re
 import time
-from scraper import get_company_website, extract_contacts  # Your Selenium-based functions
+from bs4 import BeautifulSoup
+from googlesearch import search
 
-st.title("🔍 Company Contact Info Scraper")
+# --- Function to extract contacts from a page ---
+def extract_contacts(url):
+    emails, phones = set(), set()
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            text = soup.get_text(" ", strip=True)
 
-uploaded_file = st.file_uploader("📤 Upload Excel File with Company Names", type=["xlsx"])
-if uploaded_file:
-    df = pd.read_excel(uploaded_file)
-    st.write("📄 Preview of Uploaded Data:")
-    st.dataframe(df.head())
+            # Regex for emails
+            emails.update(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text))
 
-    if st.button("🚀 Start Scraping"):
-        df['Website'] = ''
-        df['Emails'] = ''
-        df['Phones'] = ''
+            # Regex for phone numbers (international format friendly)
+            phones.update(re.findall(r"\+?\d[\d\s().-]{7,}\d", text))
+    except Exception as e:
+        pass
+    return list(emails), list(phones)
 
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+# --- Function to scrape a company ---
+def scrape_company(company_name, delay=5):
+    results = []
+    query = f"{company_name} contact OR about"
+    
+    # Search top 8 results
+    for i, url in enumerate(search(query, num_results=8)):
+        time.sleep(delay)  # Slow down for accuracy
+        emails, phones = extract_contacts(url)
+        if emails or phones:
+            results.append({"Company": company_name, "URL": url, "Emails": ", ".join(emails), "Phones": ", ".join(phones)})
+    return results
 
-        for i, company in enumerate(df[df.columns[0]]):
-            status_text.text(f"🔄 Processing {i+1}/{len(df)}: {company}")
-            website = get_company_website(company)
-            df.at[i, 'Website'] = website if website else 'Not Found'
-            if website:
-                emails, phones = extract_contacts(website)
-                df.at[i, 'Emails'] = ', '.join(emails)
-                df.at[i, 'Phones'] = ', '.join(phones)
-            progress_bar.progress((i + 1) / len(df))
-            time.sleep(2)
+# --- Streamlit UI ---
+st.title("📞 Company Contact Finder (Accurate Mode)")
+company = st.text_input("Enter Company Name:")
 
-        st.success("✅ Scraping Complete!")
-        st.dataframe(df)
-        df.to_excel("Company_Contacts.xlsx", index=False)
-        with open("Company_Contacts.xlsx", "rb") as f:
-            st.download_button("📥 Download Results", f, file_name="Company_Contacts.xlsx")
+if st.button("Search"):
+    if company.strip():
+        st.info(f"🔍 Searching for '{company}' ... Please wait, it may take ~30–60 sec")
+        data = scrape_company(company, delay=5)  # 5 sec delay for accuracy
+        if data:
+            df = pd.DataFrame(data)
+            st.dataframe(df)
+
+            # Download option
+            csv = df.to_csv(index=False).encode("utf-8")
+            st.download_button("⬇️ Download Results as CSV", data=csv, file_name="contacts.csv", mime="text/csv")
+        else:
+            st.error("No contact info found. Try a different company.")
