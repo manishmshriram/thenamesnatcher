@@ -1,6 +1,9 @@
 streamlit
 pandas
-requests
-beautifulsoup4
-duckduckgo_search
 openpyxl
+beautifulsoup4
+requests
+googlesearch-python
+urllib3
+lxml
+html5lib
