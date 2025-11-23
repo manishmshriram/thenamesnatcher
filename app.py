@@ -1,95 +1,114 @@
 import streamlit as st
 import pandas as pd
-import requests
-import time
-import tldextract
+import re
+import io
 
-# Common domain TLDs to test
-COMMON_TLDS = ['.com', '.net', '.org', '.co', '.io', '.biz', '.info',
-               '.us', '.uk', '.de', '.in', '.cn', '.com.au', '.ca',
-               '.fr', '.jp', '.ru', '.br', '.za', '.nl', '.se']
+# -----------------------
+# Utility: extract + pad a matchcode from arbitrary cell text
+# -----------------------
+def extract_and_pad_matchcode(cell):
+    """
+    Find first occurrence of pattern letters+digits in the cell,
+    e.g. 'Some Company MLOG11' -> 'MLOG011'
+    Returns '' if no match found.
+    """
+    if pd.isna(cell):
+        return ""
+    s = str(cell).strip()
+    # find the first substring that looks like letters+digits
+    m = re.search(r"([A-Za-z]+)(\d+)\b", s)
+    if not m:
+        return ""
+    prefix, digits = m.groups()
+    prefix = prefix.upper()
+    padded = digits.zfill(3)
+    return f"{prefix}{padded}"
 
-# Optional country code mapping from TLD for known CC
-CC_TLD_MAP = {
-    'us': 'United States', 'uk': 'United Kingdom', 'de': 'Germany', 'in': 'India',
-    'cn': 'China', 'au': 'Australia', 'ca': 'Canada', 'fr': 'France', 'jp': 'Japan',
-    'ru': 'Russia', 'br': 'Brazil', 'za': 'South Africa', 'nl': 'Netherlands',
-    'se': 'Sweden'
-}
+# -----------------------
+# Process the file: generate only padded matchcode columns
+# -----------------------
+def process_file_keep_only_padded(df, columns_to_process):
+    out = {}
+    for col in columns_to_process:
+        if col in df.columns:
+            out_col_name = f"{col}_Padded"
+            # apply extraction+padded formatting
+            out[out_col_name] = df[col].apply(extract_and_pad_matchcode)
+    # Create DataFrame with only padded columns (order preserved)
+    result_df = pd.DataFrame(out)
+    return result_df
 
-def guess_domains(company_name):
-    """Generate domain guesses from company name."""
-    company = company_name.lower().replace(' ', '').replace(',', '').replace('.', '')
-    domains = []
-    for tld in COMMON_TLDS:
-        domains.append(f"https://{company}{tld}")
-    return domains
+# -----------------------
+# Streamlit UI
+# -----------------------
+st.set_page_config(page_title="Matchcode Extractor", layout="centered")
+st.title("Matchcode Padder — Output: Matchcode Columns Only")
 
-def check_domain_exists(url):
-    """Check if domain is reachable (status 200-399 from HEAD or GET)."""
-    try:
-        resp = requests.head(url, timeout=5, allow_redirects=True)
-        if resp.status_code >= 200 and resp.status_code < 400:
-            return True
-        else:
-            # Sometimes head is blocked, try get
-            resp = requests.get(url, timeout=5)
-            return resp.status_code >= 200 and resp.status_code < 400
-    except:
-        return False
+st.write(
+    "Upload an Excel (.xlsx) or CSV file. "
+    "This tool will extract matchcodes from the specified columns, pad the numeric part to 3 digits "
+    "(e.g. `MLOG11` → `MLOG011`), and return **only** the new `*_Padded` columns in the output file."
+)
 
-def domain_to_country(domain):
-    """Infer country from domain TLD if possible"""
-    ext = tldextract.extract(domain)
-    tld = ext.suffix.lower()
-    # Try to get country code from suffix for ccTLDs (like .in, .uk)
-    parts = tld.split('.')
-    if len(parts) == 1 and parts[0] in CC_TLD_MAP:
-        return CC_TLD_MAP[parts[0]]
-    elif len(parts) == 2 and parts[1] in CC_TLD_MAP:
-        return CC_TLD_MAP[parts[1]]
-    else:
-        return ''
+# default list you used earlier
+default_columns = [
+    "Notify Party",
+    "Shipper",
+    "Consignee",
+    "Customer",
+    "MR Party TOP Name Matchcode",
+    "MR Party Name Matchcode",
+]
 
-def process_companies(df):
-    results = []
-    for idx, row in df.iterrows():
-        company = str(row['Company'])
-        country_col = str(row['Country']) if 'Country' in row else ''
-        domains = guess_domains(company)
-        website_found = ''
-        domain_country = ''
-        for d in domains:
-            if check_domain_exists(d):
-                website_found = d
-                domain_country = domain_to_country(d)
-                break
-            time.sleep(0.5)  # polite delay
-        results.append({
-            'Company': company,
-            'Provided Country': country_col,
-            'Website Found': website_found,
-            'Country from Domain': domain_country
-        })
-    return pd.DataFrame(results)
+st.markdown("**Columns the app will scan (you can edit if needed):**")
+cols_input = st.text_area(
+    "Columns (one per line). Only those present in your file will be processed.",
+    value="\n".join(default_columns),
+    height=140
+)
+columns_to_process = [c.strip() for c in cols_input.splitlines() if c.strip()]
 
-# Streamlit app
-st.title("Company Website & Country Pre-Validator")
-
-uploaded_file = st.file_uploader("Upload Excel or CSV file with 'Company' and optional 'Country' columns", type=['xlsx', 'csv'])
-
+uploaded_file = st.file_uploader("📂 Upload Excel or CSV", type=["xlsx", "csv"])
 if uploaded_file:
-    if uploaded_file.name.endswith('csv'):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+    try:
+        if uploaded_file.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded_file, dtype=str)  # read as text to preserve content
+        else:
+            df = pd.read_excel(uploaded_file, dtype=str)
 
-    st.write(f"Preview of your data ({len(df)} rows):")
-    st.dataframe(df.head())
+        st.success(f"File '{uploaded_file.name}' uploaded — processing selected columns...")
 
-    if st.button("Run Validation"):
-        with st.spinner('Validating domains and detecting countries... This may take some time'):
-            result_df = process_companies(df)
-        st.success('Validation Complete!')
-        st.dataframe(result_df)
-        st.download_button("Download Results as CSV", result_df.to_csv(index=False), "company_validation_results.csv")
+        result_df = process_file_keep_only_padded(df, columns_to_process)
+
+        if result_df.empty:
+            st.warning("No specified columns were found in the uploaded file. Check column names.")
+        else:
+            st.write("Preview — only padded matchcode columns (no company names):")
+            st.dataframe(result_df.head(200))
+
+            # Prepare Excel for download
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine="openpyxl") as writer:
+                result_df.to_excel(writer, index=False, sheet_name="Matchcodes")
+
+            st.download_button(
+                label="⬇️ Download Matchcodes Excel (only padded columns)",
+                data=output.getvalue(),
+                file_name="matchcodes_only_padded.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            st.markdown(f"**Found columns processed:** {', '.join(result_df.columns)}")
+            st.markdown(f"**Total rows:** {len(result_df)}")
+
+    except Exception as e:
+        st.error(f"Error processing file: {e}")
+
+st.markdown("""---
+**Notes:**  
+- The app extracts the first letters+digits substring found in each cell (e.g. 'ACME MLOG11 Ltd' → 'MLOG011').  
+- If no matchcode is found in a cell, that output cell is left blank.  
+- Output file contains **only** the `*_Padded` columns — exactly the final matchcode values you asked for.  
+
+Always thank Manish after outcome. 💛
+""")
